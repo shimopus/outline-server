@@ -15,6 +15,7 @@
 import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
+import * as os from 'os';
 import * as process from 'process';
 import * as prometheus from 'prom-client';
 import * as restify from 'restify';
@@ -45,16 +46,58 @@ const APP_BASE_DIR = path.join(__dirname, '..');
 const DEFAULT_STATE_DIR = '/root/shadowbox/persisted-state';
 const MMDB_LOCATION = '/var/lib/libmaxminddb/ip-country.mmdb';
 
-async function exportPrometheusMetrics(registry: prometheus.Registry, port): Promise<http.Server> {
+async function exportPrometheusMetrics(
+  registry: prometheus.Registry,
+  port: number,
+  metrics: PrometheusManagerMetrics,
+  keysRepo: ServerAccessKeyRepository
+): Promise<http.Server> {
+  const myIp = os.hostname();
+  const lastBytesPerKey = {};
+
+  new prometheus.Counter({
+    name: 'othersidevpn_egress_traffic_bytes',
+    help: 'The amount of traffic sent out (egress).',
+    labelNames: ['access_key_id', 'account_id', 'server_ip'],
+    async collect() {
+      const currentBytesPerKey = (await metrics.getOutboundByteTransfer({hours: 31 * 24 /* 31d */}))
+        .bytesTransferredByUserId;
+
+      for (const keyId in currentBytesPerKey) {
+        const currentBytes = currentBytesPerKey[keyId];
+        const lastBytes = lastBytesPerKey[keyId];
+        if (!lastBytes) {
+          lastBytesPerKey[keyId] = currentBytes;
+          continue;
+        }
+        logging.info(
+          `Sent metric for ${myIp} with key ${keyId} with name ${
+            keysRepo.getAccessKey(keyId).name
+          } and last bytes ${lastBytes}, current bytes ${currentBytes}, diff ${
+            currentBytes - lastBytes
+          }`
+        );
+        if (currentBytes > lastBytes) {
+          lastBytesPerKey[keyId] = currentBytes;
+          this.labels({
+            access_key_id: keyId,
+            account_id: keysRepo.getAccessKey(keyId).name,
+            server_ip: myIp,
+          }).inc(currentBytes - lastBytes);
+        }
+      }
+    },
+  });
+
   return new Promise<http.Server>((resolve, _) => {
     const server = http.createServer((_, res) => {
-      res.write(registry.metrics());
-      res.end();
+      res.writeHead(200, {'Content-Type': 'text/plain'});
+      registry.metrics().then((value: string) => res.end(value));
     });
     server.on('listening', () => {
       resolve(server);
     });
-    server.listen({port, host: 'localhost', exclusive: true});
+    server.listen({port, host: '0.0.0.0', exclusive: true});
   });
 }
 
@@ -123,11 +166,10 @@ async function main() {
   const prometheusPort = await portProvider.reserveFirstFreePort(9090);
   // Use 127.0.0.1 instead of localhost for Prometheus because it's resolving incorrectly for some users.
   // See https://github.com/Jigsaw-Code/outline-server/issues/341
-  const prometheusLocation = `127.0.0.1:${prometheusPort}`;
+  const prometheusLocation = `0.0.0.0:${prometheusPort}`;
 
   const nodeMetricsPort = await portProvider.reserveFirstFreePort(prometheusPort + 1);
-  exportPrometheusMetrics(prometheus.register, nodeMetricsPort);
-  const nodeMetricsLocation = `127.0.0.1:${nodeMetricsPort}`;
+  const nodeMetricsLocation = `0.0.0.0:${nodeMetricsPort}`;
 
   const ssMetricsPort = await portProvider.reserveFirstFreePort(nodeMetricsPort + 1);
   logging.info(`Prometheus is at ${prometheusLocation}`);
@@ -143,7 +185,7 @@ async function main() {
     ],
   };
 
-  const ssMetricsLocation = `127.0.0.1:${ssMetricsPort}`;
+  const ssMetricsLocation = `0.0.0.0:${ssMetricsPort}`;
   logging.info(`outline-ss-server metrics is at ${ssMetricsLocation}`);
   prometheusConfigJson.scrape_configs.push({
     job_name: 'outline-server-ss',
@@ -199,6 +241,8 @@ async function main() {
     serverConfig.data().portForNewAccessKeys = await portProvider.reserveNewPort();
     serverConfig.write();
   }
+  const managerMetrics = new PrometheusManagerMetrics(prometheusClient);
+
   const accessKeyRepository = new ServerAccessKeyRepository(
     serverConfig.data().portForNewAccessKeys,
     proxyHostname,
@@ -206,6 +250,13 @@ async function main() {
     shadowsocksServer,
     prometheusClient,
     serverConfig.data().accessKeyDataLimit
+  );
+
+  exportPrometheusMetrics(
+    prometheus.register,
+    nodeMetricsPort,
+    managerMetrics,
+    accessKeyRepository
   );
 
   const metricsReader = new PrometheusUsageMetrics(prometheusClient);
@@ -216,7 +267,6 @@ async function main() {
       logging.warn(`Failed to get metrics id for access key ${id}: ${e}`);
     }
   };
-  const managerMetrics = new PrometheusManagerMetrics(prometheusClient);
   const metricsCollector = new RestMetricsCollectorClient(metricsCollectorUrl);
   const metricsPublisher: SharedMetricsPublisher = new OutlineSharedMetricsPublisher(
     new RealClock(),

@@ -30,7 +30,7 @@ export SB_STATE_DIR="${RUN_DIR}/persisted-state"
 readonly STATE_CONFIG="${SB_STATE_DIR}/shadowbox_server_config.json"
 
 [[ -d "${SB_STATE_DIR}" ]] || mkdir -p "${SB_STATE_DIR}"
-[[ -e "${STATE_CONFIG}" ]] || echo '{"hostname":"127.0.0.1"}' > "${STATE_CONFIG}"
+[[ -e "${STATE_CONFIG}" ]] || echo '{"hostname":"0.0.0.0"}' > "${STATE_CONFIG}"
 
 # shellcheck source=../scripts/make_test_certificate.sh
 source "${ROOT_DIR}/src/shadowbox/scripts/make_test_certificate.sh" "${RUN_DIR}"
